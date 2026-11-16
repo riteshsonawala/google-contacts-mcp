@@ -6,6 +6,7 @@ import * as os from "node:os";
 
 import {
   GoogleContactsClient,
+  GoogleContactsBrowserClient,
   GoogleContactsMcpServer,
   parseContactsFromContent,
   loadImageData,
@@ -367,5 +368,95 @@ describe("MCP Server & Google People API Integration (Mocked)", () => {
     });
     assert.equal(imgResp.result.content[0].type, "image");
     assert.equal(imgResp.result.content[0].mimeType, "image/png");
+  });
+
+  test("GoogleContactsBrowserClient automates contacts.google.com without any Client ID or Secret", async () => {
+    let currentUrl = "https://contacts.google.com";
+    const mockDriver = {
+      goto: async (url) => {
+        currentUrl = url;
+      },
+      url: async () => currentUrl,
+      bringToFront: async () => {},
+      close: async () => {},
+      evaluate: async (fn, arg) => {
+        const fnStr = fn.toString();
+        // Login check
+        if (fnStr.includes("ServiceLogin")) {
+          return true;
+        }
+        // Count contact rows
+        if (fnStr.includes("querySelectorAll('a[href*=\"/person/\"], [data-id]').length")) {
+          return 1;
+        }
+        // Extract contacts from list DOM
+        if (fnStr.includes("seen.has(resourceName)")) {
+          return [
+            {
+              resourceName: "person/c999",
+              displayName: "Priya Sharma",
+              givenName: "Priya",
+              familyName: "Sharma",
+              emails: [{ value: "priya@sharma.dev", type: "work" }],
+              phones: [{ value: "+1-415-555-0155", type: "mobile" }],
+              organization: "Sharma Dev",
+              jobTitle: "Founder",
+              addresses: [],
+              urls: [],
+              customFields: [],
+              groups: [],
+            },
+          ];
+        }
+        // Wait for form input
+        if (fnStr.includes("First name")) {
+          currentUrl = "https://contacts.google.com/person/c999";
+          return true;
+        }
+        // Extract single contact from person DOM
+        if (fnStr.includes("window.location.pathname.match")) {
+          return {
+            resourceName: "person/c999",
+            displayName: "Priya Sharma",
+            givenName: "Priya",
+            familyName: "Sharma",
+            emails: [{ value: "priya@sharma.dev", type: "work" }],
+            phones: [
+              { value: "+1-415-555-0155", type: "mobile" },
+              { value: "+1-415-555-0199", type: "mobile" },
+            ],
+            organization: "Sharma Dev",
+            jobTitle: "Founder",
+            addresses: [],
+            urls: [],
+            customFields: [],
+            groups: [],
+          };
+        }
+        return undefined;
+      },
+    };
+
+    const browserClient = new GoogleContactsBrowserClient({ driver: mockDriver });
+    const mcpServer = new GoogleContactsMcpServer(browserClient);
+
+    const upsertResp = await mcpServer.handleIncomingMessage({
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: {
+        name: "upsert_contact",
+        arguments: {
+          fullName: "Priya Sharma",
+          emails: ["priya@sharma.dev"],
+          phones: ["+1-415-555-0199"],
+        },
+      },
+    });
+
+    const parsed = JSON.parse(upsertResp.result.content[0].text);
+    assert.equal(parsed.action, "updated");
+    assert.equal(parsed.contact.displayName, "Priya Sharma");
+    assert.equal(parsed.contact.resourceName, "person/c999");
   });
 });

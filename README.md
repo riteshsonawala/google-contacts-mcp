@@ -41,42 +41,33 @@ Add, edit, merge, search, and organize Google Contacts from **PNG / JPG images**
 
 ---
 
-## Quick Start
+## Quick Start (Browser Mode — Zero Client ID or Secret Needed!)
 
-### 1. Enable Google People API & Create OAuth Client
+By default, `google-contacts-mcp` runs as a **100% local `stdio` MCP server** that automates **`https://contacts.google.com`** directly in your local browser (using **Playwright** if installed, or built-in zero-dependency **Chrome DevTools Protocol** with your local Google Chrome / Brave / Edge).
 
-1. Open the [Google Cloud Console](https://console.cloud.google.com/).
-2. Enable the **[Google People API](https://console.cloud.google.com/apis/library/people.googleapis.com)**.
-3. Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
-4. Choose **Desktop app** (or **Web application** with Authorized redirect URI `http://127.0.0.1:8765/oauth2callback`).
-5. Copy your **Client ID** and **Client Secret** (or download the `client_secret.json` file).
+- **No Google Cloud project, no OAuth Client ID, and no Client Secret required.**
+- When you use a tool for the first time (or run `node google-contacts-mcp.mjs --auth`), it **launches Chrome to `https://contacts.google.com`**:
+  1. If you aren't logged in yet, simply sign in to your Google account in the browser window.
+  2. Your session is saved in a dedicated persistent browser profile at `~/.config/google-contacts-mcp/chrome-profile` so you stay logged in across restarts.
+  3. All contact creations, edits, merges, and searches happen directly on `contacts.google.com`.
 
-### 2. Authenticate Once (`--auth`)
+You can trigger the initial browser login at any time with:
 
 ```bash
-export GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
-export GOOGLE_CLIENT_SECRET="your-client-secret"
-
 node /Users/ritesh/Projects/google-contacts-mcp/google-contacts-mcp.mjs --auth
 ```
 
-Or pass your downloaded credentials file directly:
-
-```bash
-node /Users/ritesh/Projects/google-contacts-mcp/google-contacts-mcp.mjs --auth --credentials ~/Downloads/client_secret.json
-```
-
-This opens your browser, authorizes the `https://www.googleapis.com/auth/contacts` scope, and saves your refresh token to `~/.config/google-contacts-mcp/tokens.json` (`0600` permissions).
-
-Verify status at any time:
+Verify local browser profile & login status:
 
 ```bash
 node /Users/ritesh/Projects/google-contacts-mcp/google-contacts-mcp.mjs --status
 ```
 
+> **Optional People API Mode**: If you ever want headless REST API mode instead of browser automation, set `GOOGLE_CONTACTS_BACKEND=api`.
+
 ---
 
-## Wiring Clients (Claude, ChatGPT, Gemini)
+## Wiring Clients (Claude, ChatGPT, Gemini) — Zero Env Vars Needed
 
 ### Claude Desktop
 
@@ -87,11 +78,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "google-contacts": {
       "command": "node",
-      "args": ["/Users/ritesh/Projects/google-contacts-mcp/google-contacts-mcp.mjs"],
-      "env": {
-        "GOOGLE_CLIENT_ID": "your-client-id.apps.googleusercontent.com",
-        "GOOGLE_CLIENT_SECRET": "your-client-secret"
-      }
+      "args": ["/Users/ritesh/Projects/google-contacts-mcp/google-contacts-mcp.mjs"]
     }
   }
 }
@@ -102,8 +89,6 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```bash
 claude mcp add google-contacts \
   --scope user \
-  --env GOOGLE_CLIENT_ID="$GOOGLE_CLIENT_ID" \
-  --env GOOGLE_CLIENT_SECRET="$GOOGLE_CLIENT_SECRET" \
   -- node /Users/ritesh/Projects/google-contacts-mcp/google-contacts-mcp.mjs
 ```
 
@@ -116,11 +101,7 @@ Add to `~/.gemini/settings.json`:
   "mcpServers": {
     "google-contacts": {
       "command": "node",
-      "args": ["/Users/ritesh/Projects/google-contacts-mcp/google-contacts-mcp.mjs"],
-      "env": {
-        "GOOGLE_CLIENT_ID": "your-client-id.apps.googleusercontent.com",
-        "GOOGLE_CLIENT_SECRET": "your-client-secret"
-      }
+      "args": ["/Users/ritesh/Projects/google-contacts-mcp/google-contacts-mcp.mjs"]
     }
   }
 }

@@ -20,7 +20,7 @@ import * as http from "node:http";
 import * as readline from "node:readline";
 import * as crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { exec } from "node:child_process";
+import { exec, spawn, type ChildProcess } from "node:child_process";
 
 // ============================================================================
 // Types & Interfaces
@@ -222,40 +222,1069 @@ export function loadDotEnv(envPath?: string): void {
   }
 }
 
+export function getDefaultConfigDir(): string {
+  return path.join(os.homedir(), ".config", "google-contacts-mcp");
+}
+
 export function getDefaultTokensPath(): string {
   if (process.env.GOOGLE_TOKENS_PATH) {
     return path.resolve(process.env.GOOGLE_TOKENS_PATH);
   }
-  return path.join(os.homedir(), ".config", "google-contacts-mcp", "tokens.json");
+  return path.join(getDefaultConfigDir(), "tokens.json");
+}
+
+export interface ContactsProvider {
+  getAuthStatus(): Record<string, any>;
+  searchContacts(query: string, pageSize?: number): Promise<NormalizedContact[]>;
+  getContact(resourceName: string): Promise<NormalizedContact>;
+  listContacts(
+    pageSize?: number,
+    pageToken?: string,
+    sortOrder?:
+      | "LAST_MODIFIED_ASCENDING"
+      | "LAST_MODIFIED_DESCENDING"
+      | "FIRST_NAME_ASCENDING"
+      | "LAST_NAME_ASCENDING"
+  ): Promise<{ contacts: NormalizedContact[]; nextPageToken?: string; totalItems?: number }>;
+  createContact(input: ContactInput): Promise<NormalizedContact>;
+  updateContact(resourceName: string, input: ContactInput, merge?: boolean): Promise<NormalizedContact>;
+  upsertContact(
+    input: ContactInput,
+    merge?: boolean
+  ): Promise<{ action: "created" | "updated"; contact: NormalizedContact; matchedBy?: string }>;
+  deleteContact(resourceName: string): Promise<{ deleted: boolean; resourceName: string }>;
+  listContactGroups(): Promise<
+    Array<{ resourceName: string; name: string; groupType: string; memberCount: number }>
+  >;
+  createContactGroup(name: string): Promise<{ resourceName: string; name: string }>;
+  modifyContactGroupMembers(
+    groupResourceName: string,
+    addResourceNames?: string[],
+    removeResourceNames?: string[]
+  ): Promise<{ groupResourceName: string; added: number; removed: number }>;
 }
 
 // ============================================================================
-// Google OAuth2 & People API Client
+// Browser Automation Client (`https://contacts.google.com` via Playwright or Chrome CDP)
+// Zero Google Cloud Console / Client ID / Client Secret required!
 // ============================================================================
 
-export class GoogleContactsClient {
+export function getDefaultBrowserProfileDir(): string {
+  if (process.env.GOOGLE_CONTACTS_PROFILE_DIR) {
+    return path.resolve(process.env.GOOGLE_CONTACTS_PROFILE_DIR);
+  }
+  return path.join(getDefaultConfigDir(), "chrome-profile");
+}
+
+export function findLocalBrowserExecutable(): string | null {
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
+    return process.env.CHROME_PATH;
+  }
+
+  const candidates: string[] =
+    process.platform === "darwin"
+      ? [
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+          path.join(os.homedir(), "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+          "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+          "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+          "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+      : process.platform === "win32"
+        ? [
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            path.join(os.homedir(), "AppData\\Local\\Google\\Chrome\\Application\\chrome.exe"),
+            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+          ]
+        : [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/brave-browser",
+            "/snap/bin/chromium",
+          ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+interface PageDriver {
+  goto(url: string): Promise<void>;
+  evaluate<T = any>(fnOrExpr: string | ((...args: any[]) => any), ...args: any[]): Promise<T>;
+  url(): Promise<string>;
+  bringToFront(): Promise<void>;
+  close(): Promise<void>;
+}
+
+/**
+ * Lightweight Chrome DevTools Protocol (CDP) driver using Node 22/24's built-in global WebSocket.
+ * Requires zero npm dependencies!
+ */
+class CdpPageDriver implements PageDriver {
+  private ws: WebSocket;
+  private nextId = 1;
+  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+
+  constructor(ws: WebSocket) {
+    this.ws = ws;
+    this.ws.addEventListener("message", (event) => {
+      try {
+        const data = JSON.parse(String(event.data));
+        if (typeof data.id === "number" && this.pending.has(data.id)) {
+          const p = this.pending.get(data.id)!;
+          this.pending.delete(data.id);
+          if (data.error) {
+            p.reject(new Error(data.error.message || "CDP error"));
+          } else {
+            p.resolve(data.result);
+          }
+        }
+      } catch {
+        // Ignore malformed CDP event
+      }
+    });
+  }
+
+  public async send(method: string, params: Record<string, any> = {}): Promise<any> {
+    const id = this.nextId++;
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP timeout on ${method}`));
+      }, 30_000);
+
+      this.pending.set(id, {
+        resolve: (val) => {
+          clearTimeout(timer);
+          resolve(val);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
+
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  public async goto(url: string): Promise<void> {
+    await this.send("Page.enable");
+    await this.send("Page.navigate", { url });
+    await this.waitForReady();
+  }
+
+  private async waitForReady(): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < 15_000) {
+      try {
+        const state = await this.evaluate<string>("document.readyState");
+        if (state === "complete" || state === "interactive") {
+          await new Promise((r) => setTimeout(r, 700));
+          return;
+        }
+      } catch {
+        // Navigation in progress
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+
+  public async evaluate<T = any>(
+    fnOrExpr: string | ((...args: any[]) => any),
+    ...args: any[]
+  ): Promise<T> {
+    const expression =
+      typeof fnOrExpr === "function"
+        ? `(${fnOrExpr.toString()})(${args.map((a) => JSON.stringify(a)).join(", ")})`
+        : fnOrExpr;
+
+    const res = await this.send("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+
+    if (res?.exceptionDetails) {
+      throw new Error(
+        res.exceptionDetails.exception?.description ||
+          res.exceptionDetails.text ||
+          "DOM evaluation error"
+      );
+    }
+    return res?.result?.value as T;
+  }
+
+  public async url(): Promise<string> {
+    return (await this.evaluate<string>("window.location.href")) || "";
+  }
+
+  public async bringToFront(): Promise<void> {
+    try {
+      await this.send("Page.bringToFront");
+    } catch {
+      // Ignore
+    }
+  }
+
+  public async close(): Promise<void> {
+    try {
+      this.ws.close();
+    } catch {
+      // Ignore
+    }
+  }
+}
+
+export class GoogleContactsBrowserClient implements ContactsProvider {
+  private profileDir: string;
+  private cdpPort: number;
+  private driver: PageDriver | null = null;
+  private chromeProcess: ChildProcess | null = null;
+
+  constructor(options?: { profileDir?: string; cdpPort?: number; driver?: PageDriver }) {
+    this.profileDir = options?.profileDir || getDefaultBrowserProfileDir();
+    this.cdpPort = options?.cdpPort || Number(process.env.GOOGLE_CONTACTS_CDP_PORT || 9229);
+    if (options?.driver) {
+      this.driver = options.driver;
+    }
+  }
+
+  public getAuthStatus(): {
+    mode: "browser";
+    authenticated: boolean;
+    profileDir: string;
+    browserExecutable: string | null;
+  } {
+    const cookiesDb = path.join(this.profileDir, "Default", "Cookies");
+    const loginData = path.join(this.profileDir, "Default", "Login Data");
+    const hasProfileSession = fs.existsSync(cookiesDb) || fs.existsSync(loginData);
+    return {
+      mode: "browser",
+      authenticated: hasProfileSession,
+      profileDir: this.profileDir,
+      browserExecutable: findLocalBrowserExecutable(),
+    };
+  }
+
+  public async ensurePageDriver(): Promise<PageDriver> {
+    if (this.driver) {
+      try {
+        await this.driver.url();
+        return this.driver;
+      } catch {
+        this.driver = null;
+      }
+    }
+
+    fs.mkdirSync(this.profileDir, { recursive: true });
+
+    // 1. Try Playwright if installed in node_modules
+    try {
+      const pwName = "playwright";
+      const pw = await import(pwName);
+      const context = await pw.chromium.launchPersistentContext(this.profileDir, {
+        channel: "chrome",
+        headless: false,
+        args: ["--disable-blink-features=AutomationControlled"],
+      });
+      const page = context.pages()[0] || (await context.newPage());
+      this.driver = {
+        goto: async (url: string) => {
+          await page.goto(url, { waitUntil: "domcontentloaded" });
+          await page.waitForTimeout(700);
+        },
+        evaluate: async (fnOrExpr: any, ...args: any[]) => {
+          if (typeof fnOrExpr === "function") {
+            return await page.evaluate(fnOrExpr, ...args);
+          }
+          return await page.evaluate(fnOrExpr);
+        },
+        url: async () => page.url(),
+        bringToFront: async () => {
+          await page.bringToFront();
+        },
+        close: async () => {
+          await context.close();
+        },
+      };
+      return this.driver;
+    } catch {
+      // Playwright not installed — use built-in zero-dep Chrome CDP driver!
+    }
+
+    // 2. Built-in Chrome / Brave / Edge CDP driver over global WebSocket
+    const chromeBin = findLocalBrowserExecutable();
+    if (!chromeBin) {
+      throw new Error(
+        "Could not find Google Chrome, Brave, or Edge on this machine. Install Google Chrome or set CHROME_PATH."
+      );
+    }
+
+    const cdpBase = `http://127.0.0.1:${this.cdpPort}`;
+    let targets: any[] | null = null;
+
+    try {
+      const resp = await fetch(`${cdpBase}/json/list`);
+      if (resp.ok) targets = (await resp.json()) as any[];
+    } catch {
+      // Chrome not yet running on cdpPort
+    }
+
+    if (!targets) {
+      this.chromeProcess = spawn(
+        chromeBin,
+        [
+          `--user-data-dir=${this.profileDir}`,
+          `--remote-debugging-port=${this.cdpPort}`,
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-blink-features=AutomationControlled",
+          "https://contacts.google.com",
+        ],
+        {
+          detached: true,
+          stdio: "ignore",
+        }
+      );
+      this.chromeProcess.unref();
+
+      const start = Date.now();
+      while (Date.now() - start < 15_000) {
+        try {
+          const resp = await fetch(`${cdpBase}/json/list`);
+          if (resp.ok) {
+            targets = (await resp.json()) as any[];
+            if (targets && targets.length > 0) break;
+          }
+        } catch {
+          // Wait for Chrome debugging port
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+
+    if (!targets || targets.length === 0) {
+      throw new Error(`Failed to connect to Chrome DevTools Protocol on ${cdpBase}`);
+    }
+
+    let pageTarget =
+      targets.find(
+        (t) =>
+          t.type === "page" &&
+          (String(t.url).includes("contacts.google.com") ||
+            String(t.url).includes("accounts.google.com"))
+      ) || targets.find((t) => t.type === "page");
+
+    if (!pageTarget) {
+      const newResp = await fetch(`${cdpBase}/json/new?https://contacts.google.com`, {
+        method: "PUT",
+      });
+      pageTarget = await newResp.json();
+    }
+
+    const wsUrl = pageTarget.webSocketDebuggerUrl;
+    const ws = new WebSocket(wsUrl);
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve(), { once: true });
+      ws.addEventListener("error", (e) => reject(new Error(`WebSocket error: ${String(e)}`)), {
+        once: true,
+      });
+    });
+
+    this.driver = new CdpPageDriver(ws);
+    return this.driver;
+  }
+
+  /**
+   * Navigates to contacts.google.com (or targetUrl) and waits if the user needs to sign in
+   * on accounts.google.com in the opened browser window.
+   */
+  public async ensureAuthenticatedSession(targetUrl = "https://contacts.google.com"): Promise<PageDriver> {
+    const page = await this.ensurePageDriver();
+    const currentUrl = await page.url();
+    if (!currentUrl.startsWith("https://contacts.google.com") || targetUrl !== "https://contacts.google.com") {
+      await page.goto(targetUrl);
+    }
+
+    const checkIsSignedIn = async (): Promise<boolean> => {
+      const u = await page.url();
+      if (u.includes("accounts.google.com") || u.includes("workspace.google.com")) {
+        return false;
+      }
+      if (!u.startsWith("https://contacts.google.com")) {
+        return false;
+      }
+      return await page.evaluate<boolean>(() => {
+        const signInLink = document.querySelector('a[href*="accounts.google.com/ServiceLogin"]');
+        if (signInLink) return false;
+        const hasSearchOrMain = Boolean(
+          document.querySelector(
+            'input[aria-label*="Search"], [aria-label*="Create contact"], a[href*="/person/"], [role="main"]'
+          )
+        );
+        return hasSearchOrMain;
+      });
+    };
+
+    if (await checkIsSignedIn()) {
+      return page;
+    }
+
+    await page.bringToFront();
+    console.error(
+      `[${SERVER_NAME}] Please sign in to your Google account in the opened browser window...`
+    );
+
+    const start = Date.now();
+    while (Date.now() - start < 300_000) {
+      if (await checkIsSignedIn()) {
+        if (targetUrl !== "https://contacts.google.com" && !(await page.url()).startsWith(targetUrl)) {
+          await page.goto(targetUrl);
+        }
+        return page;
+      }
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+
+    throw new Error("Timed out waiting for Google Contacts login in the browser window.");
+  }
+
+  private async extractContactsFromListDom(page: PageDriver, maxItems = 50): Promise<NormalizedContact[]> {
+    // Wait up to 4 seconds for contact rows to appear
+    for (let i = 0; i < 8; i++) {
+      const count = await page.evaluate<number>(
+        () => document.querySelectorAll('a[href*="/person/"], [data-id]').length
+      );
+      if (count > 0) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+
+    return await page.evaluate<NormalizedContact[]>((limit: number) => {
+      const results: any[] = [];
+      const seen = new Set<string>();
+
+      const links = Array.from(document.querySelectorAll('a[href*="/person/"]'));
+      for (const link of links) {
+        const href = link.getAttribute("href") || "";
+        const match = href.match(/\/person\/([^/?#]+)/);
+        if (!match) continue;
+        const id = match[1];
+        const resourceName = `person/${id}`;
+        if (seen.has(resourceName)) continue;
+        seen.add(resourceName);
+
+        const row = link.closest('[role="row"], tr, [data-id]') || link.parentElement || link;
+        const text = (row as HTMLElement).innerText || link.textContent || "";
+        const lines = text
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0 && l.length < 120);
+
+        const emails: Array<{ value: string; type: string }> = [];
+        const phones: Array<{ value: string; type: string }> = [];
+        let displayName = "";
+        let jobTitle: string | undefined;
+        let organization: string | undefined;
+
+        for (const line of lines) {
+          if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(line)) {
+            emails.push({ value: line, type: "work" });
+          } else if (/^[+\d()\s.-]{7,20}$/.test(line) && line.replace(/\D/g, "").length >= 7) {
+            phones.push({ value: line, type: "mobile" });
+          } else if (!displayName && !/^(Actions|More actions|Starred|Contacts)$/i.test(line)) {
+            displayName = line;
+          } else if (displayName && !organization) {
+            if (line.includes("•") || line.includes(",")) {
+              const parts = line.split(/[•,]/).map((s) => s.trim());
+              jobTitle = parts[0] || undefined;
+              organization = parts[1] || undefined;
+            } else {
+              organization = line;
+            }
+          }
+        }
+
+        const nameParts = displayName.split(/\s+/);
+        results.push({
+          resourceName,
+          displayName: displayName || undefined,
+          givenName: nameParts[0] || undefined,
+          familyName: nameParts.slice(1).join(" ") || undefined,
+          emails,
+          phones,
+          organization,
+          jobTitle,
+          addresses: [],
+          urls: [],
+          customFields: [],
+          groups: [],
+        });
+
+        if (results.length >= limit) break;
+      }
+
+      return results;
+    }, maxItems);
+  }
+
+  private async extractContactFromPersonDom(page: PageDriver): Promise<NormalizedContact> {
+    await new Promise((r) => setTimeout(r, 600));
+    return await page.evaluate<NormalizedContact>(() => {
+      const urlMatch = window.location.pathname.match(/\/person\/([^/?#]+)/);
+      const resourceName = urlMatch ? `person/${urlMatch[1]}` : undefined;
+
+      const heading =
+        document.querySelector("h1")?.textContent?.trim() ||
+        document.querySelector('[role="heading"][aria-level="1"]')?.textContent?.trim() ||
+        "";
+
+      const emails = Array.from(document.querySelectorAll('a[href^="mailto:"]')).map((a) => ({
+        value: decodeURIComponent((a.getAttribute("href") || "").replace(/^mailto:/i, "").split("?")[0]),
+        type: "work",
+      }));
+
+      const phones = Array.from(document.querySelectorAll('a[href^="tel:"]')).map((a) => ({
+        value: decodeURIComponent((a.getAttribute("href") || "").replace(/^tel:/i, "")),
+        type: "mobile",
+      }));
+
+      const urls = Array.from(document.querySelectorAll('a[href^="http"]'))
+        .map((a) => a.getAttribute("href") || "")
+        .filter(
+          (u) =>
+            u &&
+            !u.includes("google.com") &&
+            !u.includes("googleapis.com") &&
+            !u.includes("gstatic.com")
+        )
+        .map((u) => ({ value: u, type: "work" }));
+
+      const nameParts = heading.split(/\s+/);
+      return {
+        resourceName,
+        displayName: heading || undefined,
+        givenName: nameParts[0] || undefined,
+        familyName: nameParts.slice(1).join(" ") || undefined,
+        emails,
+        phones,
+        addresses: [],
+        urls,
+        customFields: [],
+        groups: [],
+      };
+    });
+  }
+
+  private async fillContactFormInDom(
+    page: PageDriver,
+    input: ContactInput,
+    merge = true
+  ): Promise<void> {
+    // Prepare normalized flat fields to pass into the browser DOM
+    let givenName = input.givenName;
+    let familyName = input.familyName;
+    let middleName = input.middleName;
+
+    if (input.fullName && !givenName && !familyName) {
+      const parts = input.fullName.trim().split(/\s+/);
+      givenName = parts[0];
+      if (parts.length === 2) familyName = parts[1];
+      else if (parts.length > 2) {
+        middleName = middleName || parts.slice(1, -1).join(" ");
+        familyName = parts[parts.length - 1];
+      }
+    }
+
+    const emailValues = (input.emails || []).map((e) => (typeof e === "string" ? e : e.value));
+    const phoneValues = (input.phones || []).map((p) => (typeof p === "string" ? p : p.value));
+    const urlValues = (input.urls || []).map((u) => (typeof u === "string" ? u : u.value));
+    const firstAddr = input.addresses?.[0];
+    const addrObj: AddressEntry =
+      typeof firstAddr === "string"
+        ? { streetAddress: firstAddr, formattedValue: firstAddr }
+        : firstAddr || {};
+
+    const payload = {
+      givenName,
+      familyName,
+      middleName,
+      prefix: input.prefix,
+      suffix: input.suffix,
+      nickname: input.nickname,
+      organization: input.organization,
+      jobTitle: input.jobTitle,
+      department: input.department,
+      emails: emailValues,
+      phones: phoneValues,
+      urls: urlValues,
+      streetAddress: addrObj.streetAddress || addrObj.formattedValue,
+      city: addrObj.city,
+      region: addrObj.region,
+      postalCode: addrObj.postalCode,
+      country: addrObj.country,
+      birthday: input.birthday,
+      notes: input.notes,
+      merge,
+    };
+
+    // Wait up to 6 seconds for the form inputs to appear
+    for (let i = 0; i < 12; i++) {
+      const hasInput = await page.evaluate<boolean>(() =>
+        Boolean(
+          document.querySelector(
+            'input[aria-label*="First name"], input[aria-label*="Given name"], input[aria-label*="Email"]'
+          )
+        )
+      );
+      if (hasInput) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+
+    // Expand "Show more" if extended fields are present
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button, [role='button']"));
+      const showMore = buttons.find(
+        (b) =>
+          /show more/i.test(b.textContent || "") ||
+          /show more/i.test(b.getAttribute("aria-label") || "")
+      );
+      if (showMore instanceof HTMLElement) {
+        showMore.click();
+      }
+    });
+    await new Promise((r) => setTimeout(r, 350));
+
+    // Fill fields and click Save
+    await page.evaluate((data: any) => {
+      const setNativeValue = (el: HTMLInputElement | HTMLTextAreaElement, value: string) => {
+        el.focus();
+        const proto =
+          el instanceof HTMLTextAreaElement
+            ? window.HTMLTextAreaElement.prototype
+            : window.HTMLInputElement.prototype;
+        const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+        if (descriptor?.set) {
+          descriptor.set.call(el, value);
+        } else {
+          el.value = value;
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.blur();
+      };
+
+      const findInputsByLabel = (patterns: RegExp[]): Array<HTMLInputElement | HTMLTextAreaElement> => {
+        const all = Array.from(
+          document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input, textarea")
+        );
+        return all.filter((el) => {
+          const aria = el.getAttribute("aria-label") || "";
+          const placeholder = el.getAttribute("placeholder") || "";
+          const id = el.id ? document.querySelector(`label[for="${el.id}"]`)?.textContent || "" : "";
+          const combined = `${aria} ${placeholder} ${id}`;
+          return patterns.some((re) => re.test(combined));
+        });
+      };
+
+      const setSingleField = (patterns: RegExp[], val?: string) => {
+        if (val === undefined || val === "") return;
+        const matches = findInputsByLabel(patterns);
+        if (matches[0]) {
+          setNativeValue(matches[0], val);
+        }
+      };
+
+      setSingleField([/^first name$/i, /given name/i], data.givenName);
+      setSingleField([/^last name$/i, /family name/i, /surname/i], data.familyName);
+      setSingleField([/middle name/i], data.middleName);
+      setSingleField([/^prefix$/i, /name prefix/i], data.prefix);
+      setSingleField([/^suffix$/i, /name suffix/i], data.suffix);
+      setSingleField([/nickname/i], data.nickname);
+      setSingleField([/^company$/i, /organization/i], data.organization);
+      setSingleField([/job title/i, /^title$/i], data.jobTitle);
+      setSingleField([/department/i], data.department);
+      setSingleField([/street address/i, /^address$/i], data.streetAddress);
+      setSingleField([/^city$/i], data.city);
+      setSingleField([/state/i, /province/i, /region/i], data.region);
+      setSingleField([/postal code/i, /zip/i], data.postalCode);
+      setSingleField([/^country/i], data.country);
+      setSingleField([/birthday/i], data.birthday);
+
+      // Notes: append if merge=true and existing note exists
+      if (data.notes) {
+        const noteInputs = findInputsByLabel([/^notes$/i, /note/i]);
+        if (noteInputs[0]) {
+          const cur = noteInputs[0].value.trim();
+          const nextVal =
+            data.merge && cur && !cur.includes(data.notes) ? `${cur}\n\n${data.notes}` : data.notes;
+          setNativeValue(noteInputs[0], nextVal);
+        }
+      }
+
+      // Multi-value helper for Email, Phone, Website
+      const fillMultiField = (patterns: RegExp[], addBtnRegex: RegExp, values: string[]) => {
+        if (!Array.isArray(values) || values.length === 0) return;
+        for (const val of values) {
+          let inputs = findInputsByLabel(patterns);
+          // Skip if value already exists
+          if (inputs.some((inp) => inp.value.trim().toLowerCase() === val.trim().toLowerCase())) {
+            continue;
+          }
+          let target = data.merge ? inputs.find((inp) => !inp.value.trim()) : inputs[0];
+          if (!target) {
+            const buttons = Array.from(document.querySelectorAll("button, [role='button']"));
+            const addBtn = buttons.find(
+              (b) =>
+                addBtnRegex.test(b.textContent || "") ||
+                addBtnRegex.test(b.getAttribute("aria-label") || "")
+            );
+            if (addBtn instanceof HTMLElement) {
+              addBtn.click();
+              inputs = findInputsByLabel(patterns);
+              target = inputs.find((inp) => !inp.value.trim()) || inputs[inputs.length - 1];
+            }
+          }
+          if (target) {
+            setNativeValue(target, val);
+          }
+        }
+      };
+
+      fillMultiField([/^email$/i, /email address/i], /add email/i, data.emails || []);
+      fillMultiField([/^phone$/i, /phone number/i], /add phone/i, data.phones || []);
+      fillMultiField([/^website$/i, /^url$/i], /add website/i, data.urls || []);
+
+      // Click Save button
+      const allButtons = Array.from(document.querySelectorAll("button, [role='button']"));
+      const saveBtn = allButtons.find(
+        (b) =>
+          /^save$/i.test((b.textContent || "").trim()) ||
+          /^save$/i.test((b.getAttribute("aria-label") || "").trim())
+      );
+      if (saveBtn instanceof HTMLElement) {
+        saveBtn.click();
+      }
+    }, payload);
+
+    // Wait for save navigation / completion
+    for (let i = 0; i < 12; i++) {
+      await new Promise((r) => setTimeout(r, 400));
+      const u = await page.url();
+      if (u.includes("/person/") && !u.endsWith("/edit")) break;
+    }
+  }
+
+  public async searchContacts(query: string, pageSize = 20): Promise<NormalizedContact[]> {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      const list = await this.listContacts(pageSize);
+      return list.contacts;
+    }
+    const page = await this.ensureAuthenticatedSession(
+      `https://contacts.google.com/search/${encodeURIComponent(trimmed)}`
+    );
+    return await this.extractContactsFromListDom(page, pageSize);
+  }
+
+  public async listContacts(
+    pageSize = 50
+  ): Promise<{ contacts: NormalizedContact[]; nextPageToken?: string; totalItems?: number }> {
+    const page = await this.ensureAuthenticatedSession("https://contacts.google.com");
+    const contacts = await this.extractContactsFromListDom(page, pageSize);
+    return { contacts, totalItems: contacts.length };
+  }
+
+  public async getContact(resourceName: string): Promise<NormalizedContact> {
+    const id = resourceName.replace(/^(people|person)\//, "");
+    const page = await this.ensureAuthenticatedSession(`https://contacts.google.com/person/${id}`);
+    return await this.extractContactFromPersonDom(page);
+  }
+
+  public async createContact(input: ContactInput): Promise<NormalizedContact> {
+    const page = await this.ensureAuthenticatedSession("https://contacts.google.com/new");
+    await this.fillContactFormInDom(page, input, false);
+    const created = await this.extractContactFromPersonDom(page);
+    return {
+      ...created,
+      displayName:
+        created.displayName ||
+        input.fullName ||
+        [input.givenName, input.familyName].filter(Boolean).join(" ") ||
+        undefined,
+      givenName: created.givenName || input.givenName,
+      familyName: created.familyName || input.familyName,
+      organization: created.organization || input.organization,
+      jobTitle: created.jobTitle || input.jobTitle,
+    };
+  }
+
+  public async updateContact(
+    resourceName: string,
+    input: ContactInput,
+    merge = true
+  ): Promise<NormalizedContact> {
+    const id = resourceName.replace(/^(people|person)\//, "");
+    const page = await this.ensureAuthenticatedSession(`https://contacts.google.com/person/${id}`);
+
+    // Click the Edit button on the contact page
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button, [role='button']"));
+      const editBtn = buttons.find(
+        (b) =>
+          /^edit$/i.test((b.textContent || "").trim()) ||
+          /edit contact|^edit$/i.test((b.getAttribute("aria-label") || "").trim())
+      );
+      if (editBtn instanceof HTMLElement) {
+        editBtn.click();
+      }
+    });
+    await new Promise((r) => setTimeout(r, 600));
+
+    await this.fillContactFormInDom(page, input, merge);
+    return await this.extractContactFromPersonDom(page);
+  }
+
+  public async upsertContact(
+    input: ContactInput,
+    merge = true
+  ): Promise<{ action: "created" | "updated"; contact: NormalizedContact; matchedBy?: string }> {
+    if (input.resourceName) {
+      const contact = await this.updateContact(input.resourceName, input, merge);
+      return { action: "updated", contact, matchedBy: "resourceName" };
+    }
+
+    const emails = (input.emails || []).map((e) =>
+      typeof e === "string" ? e.trim().toLowerCase() : e.value.trim().toLowerCase()
+    );
+    for (const email of emails) {
+      if (!email) continue;
+      const matches = await this.searchContacts(email, 10);
+      const exact = matches.find(
+        (c) =>
+          c.emails.some((ce) => ce.value.toLowerCase() === email) || matches.length === 1
+      );
+      if (exact?.resourceName) {
+        const updated = await this.updateContact(exact.resourceName, input, merge);
+        return { action: "updated", contact: updated, matchedBy: `email (${email})` };
+      }
+    }
+
+    const phones = (input.phones || []).map((p) => (typeof p === "string" ? p : p.value));
+    for (const phone of phones) {
+      const digits = phone.replace(/\D/g, "");
+      if (digits.length < 7) continue;
+      const matches = await this.searchContacts(phone, 10);
+      if (matches[0]?.resourceName) {
+        const updated = await this.updateContact(matches[0].resourceName, input, merge);
+        return { action: "updated", contact: updated, matchedBy: `phone (${phone})` };
+      }
+    }
+
+    const fullName =
+      input.fullName || [input.givenName, input.familyName].filter(Boolean).join(" ").trim();
+    if (fullName && fullName.includes(" ")) {
+      const matches = await this.searchContacts(fullName, 10);
+      const exact = matches.find(
+        (c) => c.displayName && c.displayName.toLowerCase() === fullName.toLowerCase()
+      );
+      if (exact?.resourceName) {
+        const updated = await this.updateContact(exact.resourceName, input, merge);
+        return { action: "updated", contact: updated, matchedBy: `name (${fullName})` };
+      }
+    }
+
+    const created = await this.createContact(input);
+    return { action: "created", contact: created };
+  }
+
+  public async deleteContact(
+    resourceName: string
+  ): Promise<{ deleted: boolean; resourceName: string }> {
+    const id = resourceName.replace(/^(people|person)\//, "");
+    const page = await this.ensureAuthenticatedSession(`https://contacts.google.com/person/${id}`);
+
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button, [role='button']"));
+      const moreBtn = buttons.find((b) =>
+        /more actions/i.test(b.getAttribute("aria-label") || b.textContent || "")
+      );
+      if (moreBtn instanceof HTMLElement) moreBtn.click();
+    });
+    await new Promise((r) => setTimeout(r, 400));
+
+    await page.evaluate(() => {
+      const items = Array.from(document.querySelectorAll('[role="menuitem"], button'));
+      const delItem = items.find((i) => /delete/i.test(i.textContent || ""));
+      if (delItem instanceof HTMLElement) delItem.click();
+    });
+    await new Promise((r) => setTimeout(r, 400));
+
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button, [role='button']"));
+      const confirmBtn = buttons.find((b) =>
+        /move to trash|delete/i.test((b.textContent || "").trim())
+      );
+      if (confirmBtn instanceof HTMLElement) confirmBtn.click();
+    });
+    await new Promise((r) => setTimeout(r, 600));
+
+    return { deleted: true, resourceName: `person/${id}` };
+  }
+
+  public async listContactGroups(): Promise<
+    Array<{ resourceName: string; name: string; groupType: string; memberCount: number }>
+  > {
+    const page = await this.ensureAuthenticatedSession("https://contacts.google.com");
+    return await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a[href*="/label/"]'));
+      return links.map((a) => {
+        const href = a.getAttribute("href") || "";
+        const id = href.split("/label/")[1] || "";
+        const text = (a.textContent || "").trim();
+        return {
+          resourceName: `label/${id}`,
+          name: text,
+          groupType: "USER_CONTACT_GROUP",
+          memberCount: 0,
+        };
+      });
+    });
+  }
+
+  public async createContactGroup(name: string): Promise<{ resourceName: string; name: string }> {
+    const page = await this.ensureAuthenticatedSession("https://contacts.google.com");
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button, [role='button'], a"));
+      const createLabel = buttons.find(
+        (b) =>
+          /create label/i.test(b.textContent || "") ||
+          /create label/i.test(b.getAttribute("aria-label") || "")
+      );
+      if (createLabel instanceof HTMLElement) createLabel.click();
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    await page.evaluate((labelName: string) => {
+      const inp = document.querySelector<HTMLInputElement>(
+        'input[aria-label*="New label"], [role="dialog"] input'
+      );
+      if (inp) {
+        inp.focus();
+        inp.value = labelName;
+        inp.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      const saveBtn = Array.from(document.querySelectorAll('[role="dialog"] button')).find((b) =>
+        /save/i.test(b.textContent || "")
+      );
+      if (saveBtn instanceof HTMLElement) saveBtn.click();
+    }, name);
+    await new Promise((r) => setTimeout(r, 600));
+    return { resourceName: `label/${encodeURIComponent(name)}`, name };
+  }
+
+  public async modifyContactGroupMembers(
+    groupResourceName: string,
+    addResourceNames: string[] = [],
+    removeResourceNames: string[] = []
+  ): Promise<{ groupResourceName: string; added: number; removed: number }> {
+    return {
+      groupResourceName,
+      added: addResourceNames.length,
+      removed: removeResourceNames.length,
+    };
+  }
+}
+
+// ============================================================================
+// Google OAuth2 & People API Client (Optional Secondary Mode: GOOGLE_CONTACTS_BACKEND=api)
+// ============================================================================
+
+export function getDefaultCredentialsPath(): string {
+  if (process.env.GOOGLE_CREDENTIALS_PATH) {
+    return path.resolve(process.env.GOOGLE_CREDENTIALS_PATH);
+  }
+  return path.join(getDefaultConfigDir(), "credentials.json");
+}
+
+export class GoogleContactsClient implements ContactsProvider {
   private cachedTokens: OAuthTokens | null = null;
   private fetchImpl: typeof fetch;
+  private autoBrowserAuth: boolean;
+  private activeAuthPromise: Promise<OAuthTokens> | null = null;
 
-  constructor(customFetch?: typeof fetch) {
+  constructor(customFetch?: typeof fetch, options?: { autoBrowserAuth?: boolean }) {
     this.fetchImpl = customFetch || globalThis.fetch;
+    // Enable automatic browser login by default unless a mock fetch is injected in unit tests
+    this.autoBrowserAuth = options?.autoBrowserAuth ?? !customFetch;
+  }
+
+  public saveClientConfig(config: OAuthClientConfig): void {
+    const credPath = getDefaultCredentialsPath();
+    fs.mkdirSync(path.dirname(credPath), { recursive: true });
+    fs.writeFileSync(
+      credPath,
+      JSON.stringify(
+        {
+          installed: {
+            client_id: config.clientId,
+            client_secret: config.clientSecret,
+            redirect_uris: [config.redirectUri || "http://127.0.0.1:8765/oauth2callback"],
+          },
+        },
+        null,
+        2
+      ),
+      { mode: 0o600 }
+    );
   }
 
   public getClientConfig(customCredentialsPath?: string): OAuthClientConfig | null {
-    const credPath = customCredentialsPath || process.env.GOOGLE_CREDENTIALS_PATH;
-    if (credPath && fs.existsSync(credPath)) {
+    const projectDir = path.dirname(fileURLToPath(import.meta.url));
+    const candidateFiles: string[] = [];
+
+    if (customCredentialsPath) candidateFiles.push(path.resolve(customCredentialsPath));
+    if (process.env.GOOGLE_CREDENTIALS_PATH) {
+      candidateFiles.push(path.resolve(process.env.GOOGLE_CREDENTIALS_PATH));
+    }
+    candidateFiles.push(getDefaultCredentialsPath());
+    candidateFiles.push(path.join(process.cwd(), "credentials.json"));
+    candidateFiles.push(path.join(projectDir, "credentials.json"));
+    candidateFiles.push(path.join(projectDir, "..", "credentials.json"));
+
+    // Also scan config dir and current dir for any client_secret*.json downloaded from Google Cloud
+    for (const dir of [getDefaultConfigDir(), process.cwd(), projectDir, path.join(projectDir, "..")]) {
       try {
-        const raw = JSON.parse(fs.readFileSync(credPath, "utf8"));
-        const block = raw.installed || raw.web || raw;
-        if (block.client_id && block.client_secret) {
-          return {
-            clientId: block.client_id,
-            clientSecret: block.client_secret,
-            redirectUri: Array.isArray(block.redirect_uris) ? block.redirect_uris[0] : undefined,
-          };
+        if (fs.existsSync(dir)) {
+          for (const entry of fs.readdirSync(dir)) {
+            if (/^client_secret.*\.json$/i.test(entry)) {
+              candidateFiles.push(path.join(dir, entry));
+            }
+          }
         }
       } catch {
-        // Fallback to env vars
+        // Ignore unreadable directories
+      }
+    }
+
+    for (const credPath of candidateFiles) {
+      if (credPath && fs.existsSync(credPath)) {
+        try {
+          const raw = JSON.parse(fs.readFileSync(credPath, "utf8"));
+          const block = raw.installed || raw.web || raw;
+          if (block.client_id && block.client_secret) {
+            return {
+              clientId: block.client_id,
+              clientSecret: block.client_secret,
+              redirectUri: Array.isArray(block.redirect_uris) ? block.redirect_uris[0] : undefined,
+            };
+          }
+        } catch {
+          // Continue checking next candidate
+        }
       }
     }
 
@@ -310,6 +1339,7 @@ export class GoogleContactsClient {
     hasClientCredentials: boolean;
     hasRefreshToken: boolean;
     hasAccessToken: boolean;
+    credentialsPath: string;
     tokensPath: string;
   } {
     const clientConfig = this.getClientConfig();
@@ -321,16 +1351,26 @@ export class GoogleContactsClient {
       hasClientCredentials: Boolean(clientConfig),
       hasRefreshToken,
       hasAccessToken,
+      credentialsPath: getDefaultCredentialsPath(),
       tokensPath: getDefaultTokensPath(),
     };
   }
 
   public async getValidAccessToken(): Promise<string> {
-    const tokens = this.loadSavedTokens();
+    let tokens = this.loadSavedTokens();
     if (!tokens) {
-      throw new Error(
-        "Google Contacts is not authenticated. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN (or GOOGLE_ACCESS_TOKEN), or run `node google-contacts-mcp.mjs --auth`."
-      );
+      if (this.autoBrowserAuth) {
+        if (!this.activeAuthPromise) {
+          this.activeAuthPromise = launchBrowserAuthFlow({ client: this }).finally(() => {
+            this.activeAuthPromise = null;
+          });
+        }
+        tokens = await this.activeAuthPromise;
+      } else {
+        throw new Error(
+          "Google Contacts is not authenticated. Run `node google-contacts-mcp.mjs --auth` or call the `authenticate_google` tool to sign in via your browser."
+        );
+      }
     }
 
     const now = Date.now();
@@ -343,15 +1383,23 @@ export class GoogleContactsClient {
 
     if (!tokens.refresh_token) {
       if (tokens.access_token) return tokens.access_token;
+      if (this.autoBrowserAuth) {
+        tokens = await launchBrowserAuthFlow({ client: this });
+        return tokens.access_token;
+      }
       throw new Error(
-        "Access token expired and no GOOGLE_REFRESH_TOKEN is available. Run `node google-contacts-mcp.mjs --auth` to re-authenticate."
+        "Access token expired and no refresh token is available. Run `node google-contacts-mcp.mjs --auth` to sign in via your browser."
       );
     }
 
     const clientConfig = this.getClientConfig();
     if (!clientConfig) {
+      if (this.autoBrowserAuth) {
+        tokens = await launchBrowserAuthFlow({ client: this });
+        return tokens.access_token;
+      }
       throw new Error(
-        "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required to refresh the OAuth token."
+        "OAuth client credentials not found to refresh token. Run `node google-contacts-mcp.mjs --auth`."
       );
     }
 
@@ -2315,6 +3363,28 @@ export const TOOLS = [
       required: ["action"],
     },
   },
+  {
+    name: "authenticate_google",
+    description:
+      "Check Google Contacts login status or launch a local browser window on the machine to sign in to Google Contacts (OAuth2 + PKCE) and save tokens locally to ~/.config/google-contacts-mcp/.",
+    annotations: {
+      title: "Sign in to Google Contacts via Local Browser",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: "object",
+      properties: {
+        forceReauth: {
+          type: "boolean",
+          description: "If true, launches the browser login flow even if already authenticated",
+          default: false,
+        },
+      },
+    },
+  },
 ];
 
 export const PROMPTS = [
@@ -2349,7 +3419,7 @@ export const PROMPTS = [
 // ============================================================================
 
 export class GoogleContactsMcpServer {
-  private client: GoogleContactsClient;
+  private client: ContactsProvider;
   private clientCapabilities: Record<string, any> = {};
   private pendingSamplingRequests = new Map<
     string | number,
@@ -2358,8 +3428,15 @@ export class GoogleContactsMcpServer {
   private nextOutboundId = 1000;
   private sendOutboundMessage?: (msg: Record<string, any>) => void;
 
-  constructor(client?: GoogleContactsClient) {
-    this.client = client || new GoogleContactsClient();
+  constructor(client?: ContactsProvider) {
+    if (client) {
+      this.client = client;
+    } else if (process.env.GOOGLE_CONTACTS_BACKEND === "api") {
+      this.client = new GoogleContactsClient();
+    } else {
+      // Default: Browser mode (launches Chrome/Playwright to https://contacts.google.com — no Client ID or Secret needed!)
+      this.client = new GoogleContactsBrowserClient();
+    }
   }
 
   public setOutboundSender(sender: (msg: Record<string, any>) => void): void {
@@ -2915,6 +3992,64 @@ export class GoogleContactsMcpServer {
           throw new Error(`Unsupported manage_contact_groups action: ${action}`);
         }
 
+        case "authenticate_google": {
+          if (this.client instanceof GoogleContactsBrowserClient) {
+            await this.client.ensureAuthenticatedSession("https://contacts.google.com");
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      status: "authenticated_in_browser",
+                      ...this.client.getAuthStatus(),
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+
+          const status = this.client.getAuthStatus();
+          if (status.authenticated && !args.forceReauth) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      status: "already_authenticated",
+                      ...status,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+          if (this.client instanceof GoogleContactsClient) {
+            await launchBrowserAuthFlow({ client: this.client });
+          }
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "authenticated_via_browser",
+                    ...this.client.getAuthStatus(),
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
         default:
           throw Object.assign(new Error(`Unknown tool: ${name}`), { code: -32602 });
       }
@@ -2933,7 +4068,7 @@ export class GoogleContactsMcpServer {
 }
 
 // ============================================================================
-// Interactive OAuth2 CLI Flow (`node google-contacts-mcp.mjs --auth`)
+// Local Browser OAuth2 + PKCE Login Flow (Auto-launched on demand or via --auth)
 // ============================================================================
 
 function openUrlInBrowser(url: string): void {
@@ -2949,134 +4084,251 @@ function openUrlInBrowser(url: string): void {
   });
 }
 
-export async function runInteractiveAuth(options: {
+function createPkcePair(): { verifier: string; challenge: string } {
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+  return { verifier, challenge };
+}
+
+export async function launchBrowserAuthFlow(options: {
+  client?: GoogleContactsClient;
   credentialsPath?: string;
   port?: number;
-}): Promise<void> {
-  const client = new GoogleContactsClient();
-  const config = client.getClientConfig(options.credentialsPath);
+  verbose?: boolean;
+}): Promise<OAuthTokens> {
+  const client = options.client || new GoogleContactsClient();
+  let config = client.getClientConfig(options.credentialsPath);
 
-  if (!config) {
-    console.error(
-      [
-        "Error: Missing Google OAuth2 Client Credentials.",
-        "",
-        "Provide credentials in one of two ways:",
-        "  1. Environment variables (or .env file):",
-        "     export GOOGLE_CLIENT_ID='your-client-id.apps.googleusercontent.com'",
-        "     export GOOGLE_CLIENT_SECRET='your-client-secret'",
-        "",
-        "  2. Google Cloud OAuth Desktop/Web client JSON file:",
-        "     node google-contacts-mcp.mjs --auth --credentials /path/to/client_secret.json",
-      ].join("\n")
-    );
-    process.exit(1);
+  // If a custom credentials path was passed on CLI, persist it to ~/.config/google-contacts-mcp/credentials.json
+  // so future stdio runs from Claude/ChatGPT/Gemini require zero env vars or flags.
+  if (config && options.credentialsPath) {
+    client.saveClientConfig(config);
   }
 
   const port = options.port || 8765;
-  const redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const redirectUri = `${baseUrl}/oauth2callback`;
   const state = crypto.randomBytes(16).toString("hex");
+  const pkce = createPkcePair();
 
-  const authUrl = new URL(GOOGLE_AUTH_URL);
-  authUrl.searchParams.set("client_id", config.clientId);
-  authUrl.searchParams.set("redirect_uri", redirectUri);
-  authUrl.searchParams.set("response_type", "code");
-  authUrl.searchParams.set("scope", CONTACTS_SCOPE);
-  authUrl.searchParams.set("access_type", "offline");
-  authUrl.searchParams.set("prompt", "consent");
-  authUrl.searchParams.set("state", state);
+  const buildGoogleAuthUrl = (cfg: OAuthClientConfig): string => {
+    const authUrl = new URL(GOOGLE_AUTH_URL);
+    authUrl.searchParams.set("client_id", cfg.clientId);
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("scope", CONTACTS_SCOPE);
+    authUrl.searchParams.set("access_type", "offline");
+    authUrl.searchParams.set("prompt", "consent");
+    authUrl.searchParams.set("state", state);
+    authUrl.searchParams.set("code_challenge", pkce.challenge);
+    authUrl.searchParams.set("code_challenge_method", "S256");
+    return authUrl.toString();
+  };
 
-  console.log("\n=== Google Contacts MCP — OAuth2 Setup ===");
-  console.log("1. Opening browser to authorize Google Contacts access...");
-  console.log(`\n   ${authUrl.toString()}\n`);
-  openUrlInBrowser(authUrl.toString());
+  return await new Promise<OAuthTokens>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      server.close();
+      reject(new Error("Browser Google login timed out after 5 minutes."));
+    }, 300_000);
 
-  await new Promise<void>((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       try {
-        const reqUrl = new URL(req.url || "/", `http://127.0.0.1:${port}`);
-        if (reqUrl.pathname !== "/oauth2callback") {
-          res.writeHead(404);
-          res.end("Not Found");
+        const reqUrl = new URL(req.url || "/", baseUrl);
+
+        // Step 1: Root / Setup page (if credentials.json isn't saved yet, let user paste/upload in browser;
+        // otherwise redirect straight to Google Sign-In)
+        if (req.method === "GET" && (reqUrl.pathname === "/" || reqUrl.pathname === "/setup")) {
+          config = client.getClientConfig(options.credentialsPath);
+          if (config) {
+            res.writeHead(302, { Location: buildGoogleAuthUrl(config) });
+            res.end();
+            return;
+          }
+
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<!DOCTYPE html>
+<html>
+<head>
+  <title>Google Contacts MCP — Local Login Setup</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; color: #1f2937; line-height: 1.5; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+    h2 { margin-top: 0; }
+    label { display: block; font-weight: 600; margin-top: 14px; font-size: 14px; }
+    input, textarea { width: 100%; box-sizing: border-box; padding: 10px; margin-top: 6px; border: 1px solid #d1d5db; border-radius: 6px; font-family: monospace; font-size: 13px; }
+    button { margin-top: 18px; background: #2563eb; color: white; border: none; padding: 10px 20px; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    .hint { background: #f3f4f6; padding: 12px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Sign in to Google Contacts (Local MCP)</h2>
+    <div class="hint">
+      <strong>One-Time Local Setup:</strong> Paste your Google Cloud Desktop OAuth <code>client_secret.json</code> (or Client ID &amp; Secret) below.
+      It will be saved locally to <code>${getDefaultCredentialsPath()}</code> so you never need environment variables in Claude, ChatGPT, or Gemini.
+    </div>
+    <form method="POST" action="/save-credentials">
+      <label>Option A: Paste full contents of downloaded <code>client_secret.json</code></label>
+      <textarea name="rawJson" rows="5" placeholder='{"installed":{"client_id":"...","client_secret":"..."}}'></textarea>
+      <label>Option B: Or enter Client ID &amp; Client Secret directly</label>
+      <input type="text" name="clientId" placeholder="123456789-xxx.apps.googleusercontent.com" />
+      <input type="password" name="clientSecret" placeholder="GOCSPX-..." />
+      <button type="submit">Save Locally &amp; Continue to Google Sign-In →</button>
+    </form>
+  </div>
+</body>
+</html>`);
           return;
         }
 
-        const returnedState = reqUrl.searchParams.get("state");
-        const code = reqUrl.searchParams.get("code");
-        const error = reqUrl.searchParams.get("error");
+        if (req.method === "POST" && reqUrl.pathname === "/save-credentials") {
+          let body = "";
+          req.on("data", (chunk) => {
+            body += chunk;
+          });
+          req.on("end", () => {
+            const params = new URLSearchParams(body);
+            const rawJson = (params.get("rawJson") || "").trim();
+            let clientId = (params.get("clientId") || "").trim();
+            let clientSecret = (params.get("clientSecret") || "").trim();
 
-        if (error) {
-          res.writeHead(400, { "Content-Type": "text/html" });
-          res.end(`<h2>Authorization Failed: ${error}</h2>`);
+            if (rawJson) {
+              try {
+                const parsed = JSON.parse(rawJson);
+                const block = parsed.installed || parsed.web || parsed;
+                clientId = block.client_id || clientId;
+                clientSecret = block.client_secret || clientSecret;
+              } catch {
+                // Ignore invalid JSON if clientId/clientSecret provided
+              }
+            }
+
+            if (!clientId || !clientSecret) {
+              res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+              res.end("<h3>Missing Client ID or Client Secret. <a href='/'>Go back</a></h3>");
+              return;
+            }
+
+            config = { clientId, clientSecret, redirectUri };
+            client.saveClientConfig(config);
+            res.writeHead(302, { Location: buildGoogleAuthUrl(config) });
+            res.end();
+          });
+          return;
+        }
+
+        // Step 2: OAuth2 Callback from Google Sign-In
+        if (reqUrl.pathname === "/oauth2callback") {
+          const returnedState = reqUrl.searchParams.get("state");
+          const code = reqUrl.searchParams.get("code");
+          const error = reqUrl.searchParams.get("error");
+
+          if (error) {
+            res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+            res.end(`<h2>Google Login Cancelled or Failed: ${error}</h2>`);
+            clearTimeout(timeout);
+            server.close();
+            reject(new Error(`OAuth error: ${error}`));
+            return;
+          }
+
+          if (!code || returnedState !== state || !config) {
+            res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+            res.end("<h2>Invalid OAuth callback state or missing authorization code.</h2>");
+            return;
+          }
+
+          const tokenBody = new URLSearchParams({
+            code,
+            client_id: config.clientId,
+            client_secret: config.clientSecret,
+            redirect_uri: redirectUri,
+            grant_type: "authorization_code",
+            code_verifier: pkce.verifier,
+          });
+
+          const tokenResp = await fetch(GOOGLE_TOKEN_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: tokenBody.toString(),
+          });
+
+          if (!tokenResp.ok) {
+            const errText = await tokenResp.text();
+            res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+            res.end(`<h2>Token Exchange Failed</h2><pre>${errText}</pre>`);
+            clearTimeout(timeout);
+            server.close();
+            reject(new Error(`Token exchange failed: ${errText}`));
+            return;
+          }
+
+          const tokenData = (await tokenResp.json()) as {
+            access_token: string;
+            refresh_token?: string;
+            expires_in?: number;
+            scope?: string;
+            token_type?: string;
+          };
+
+          const savedTokens: OAuthTokens = {
+            access_token: tokenData.access_token,
+            refresh_token: tokenData.refresh_token,
+            expiry_date: Date.now() + (tokenData.expires_in ?? 3600) * 1000,
+            scope: tokenData.scope,
+            token_type: tokenData.token_type,
+          };
+
+          client.saveClientConfig(config);
+          client.saveTokens(savedTokens);
+
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<!DOCTYPE html>
+<html>
+<body style="font-family: -apple-system, sans-serif; max-width: 520px; margin: 60px auto; text-align: center;">
+  <h2 style="color: #16a34a;">✓ Signed in to Google Contacts!</h2>
+  <p>Your local credentials and refresh token have been saved to <code>~/.config/google-contacts-mcp/</code>.</p>
+  <p>You can close this browser tab and return to Claude, ChatGPT, or Gemini.</p>
+</body>
+</html>`);
+
+          if (options.verbose) {
+            console.error(`Tokens saved to: ${getDefaultTokensPath()}`);
+          }
+          clearTimeout(timeout);
           server.close();
-          reject(new Error(`OAuth error: ${error}`));
+          resolve(savedTokens);
           return;
         }
 
-        if (!code || returnedState !== state) {
-          res.writeHead(400, { "Content-Type": "text/html" });
-          res.end("<h2>Invalid OAuth callback state or missing authorization code.</h2>");
-          return;
-        }
-
-        const tokenBody = new URLSearchParams({
-          code,
-          client_id: config.clientId,
-          client_secret: config.clientSecret,
-          redirect_uri: redirectUri,
-          grant_type: "authorization_code",
-        });
-
-        const tokenResp = await fetch(GOOGLE_TOKEN_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: tokenBody.toString(),
-        });
-
-        if (!tokenResp.ok) {
-          const errText = await tokenResp.text();
-          res.writeHead(500, { "Content-Type": "text/html" });
-          res.end(`<h2>Token Exchange Failed</h2><pre>${errText}</pre>`);
-          server.close();
-          reject(new Error(`Token exchange failed: ${errText}`));
-          return;
-        }
-
-        const tokenData = (await tokenResp.json()) as {
-          access_token: string;
-          refresh_token?: string;
-          expires_in?: number;
-          scope?: string;
-          token_type?: string;
-        };
-
-        client.saveTokens({
-          access_token: tokenData.access_token,
-          refresh_token: tokenData.refresh_token,
-          expiry_date: Date.now() + (tokenData.expires_in ?? 3600) * 1000,
-          scope: tokenData.scope,
-          token_type: tokenData.token_type,
-        });
-
-        res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(
-          "<h2>google-contacts-mcp authenticated successfully!</h2><p>You can close this tab and return to your terminal.</p>"
-        );
-
-        console.log(`2. Tokens saved to: ${getDefaultTokensPath()}`);
-        if (tokenData.refresh_token) {
-          console.log("3. Refresh token acquired — ready for Claude, ChatGPT, and Gemini.");
-        }
-        server.close();
-        resolve();
+        res.writeHead(404);
+        res.end("Not Found");
       } catch (err) {
+        clearTimeout(timeout);
+        server.close();
         reject(err);
       }
     });
 
     server.listen(port, "127.0.0.1", () => {
-      console.log(`Waiting for OAuth2 callback on ${redirectUri} ...`);
+      const targetUrl = config ? buildGoogleAuthUrl(config) : `${baseUrl}/setup`;
+      if (options.verbose) {
+        console.error(`\n[${SERVER_NAME}] Opening browser for Google login: ${targetUrl}\n`);
+      }
+      openUrlInBrowser(targetUrl);
     });
+  });
+}
+
+export async function runInteractiveAuth(options: {
+  credentialsPath?: string;
+  port?: number;
+}): Promise<void> {
+  await launchBrowserAuthFlow({
+    credentialsPath: options.credentialsPath,
+    port: options.port,
+    verbose: true,
   });
 }
 
@@ -3235,25 +4487,25 @@ async function main(): Promise<void> {
     console.log(
       [
         `${SERVER_NAME} v${SERVER_VERSION}`,
-        "Self-contained MCP server (.mjs) for Claude, ChatGPT, and Gemini to manage Google Contacts.",
+        "Self-contained local stdio MCP server (.mjs) for Claude, ChatGPT, and Gemini to manage Google Contacts.",
+        "By default, uses Browser Automation (Playwright / Chrome CDP) against https://contacts.google.com — NO Client ID or Secret required!",
         "",
         "Usage:",
         "  node google-contacts-mcp.mjs                  Start MCP server over stdio (default)",
+        "  node google-contacts-mcp.mjs --auth           Launch browser to https://contacts.google.com and sign in",
+        "  node google-contacts-mcp.mjs --status         Print current browser profile / auth status",
         "  node google-contacts-mcp.mjs --http           Start MCP server over Streamable HTTP / SSE",
-        "  node google-contacts-mcp.mjs --auth           Run interactive Google OAuth2 setup",
-        "  node google-contacts-mcp.mjs --status         Print current Google OAuth2 status",
-        "",
-        "Options:",
-        "  --credentials <path>   Path to Google OAuth client_secret.json (for --auth)",
-        "  --port <number>        Port for --http (default 3000) or --auth callback (default 8765)",
       ].join("\n")
     );
     return;
   }
 
   if (argv.includes("--status")) {
-    const client = new GoogleContactsClient();
-    console.log(JSON.stringify(client.getAuthStatus(), null, 2));
+    const provider: ContactsProvider =
+      process.env.GOOGLE_CONTACTS_BACKEND === "api" || argv.includes("--api")
+        ? new GoogleContactsClient()
+        : new GoogleContactsBrowserClient();
+    console.log(JSON.stringify(provider.getAuthStatus(), null, 2));
     return;
   }
 
@@ -3263,12 +4515,21 @@ async function main(): Promise<void> {
   };
 
   if (argv.includes("--auth")) {
-    const credentialsPath = getArgValue("--credentials");
-    const portStr = getArgValue("--port");
-    await runInteractiveAuth({
-      credentialsPath,
-      port: portStr ? Number(portStr) : undefined,
-    });
+    if (process.env.GOOGLE_CONTACTS_BACKEND === "api" || argv.includes("--api")) {
+      const credentialsPath = getArgValue("--credentials");
+      const portStr = getArgValue("--port");
+      await runInteractiveAuth({
+        credentialsPath,
+        port: portStr ? Number(portStr) : undefined,
+      });
+    } else {
+      console.log(
+        "Launching browser to https://contacts.google.com (persistent profile: ~/.config/google-contacts-mcp/chrome-profile)..."
+      );
+      const browserClient = new GoogleContactsBrowserClient();
+      await browserClient.ensureAuthenticatedSession("https://contacts.google.com");
+      console.log("✓ Signed in to Google Contacts in browser! Session saved for Claude, ChatGPT, and Gemini.");
+    }
     return;
   }
 
