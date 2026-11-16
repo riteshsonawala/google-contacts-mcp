@@ -1,0 +1,44 @@
+{
+  "name": "google-contacts-mcp",
+  "version": "1.0.0",
+  "description": "Self-contained Node.js/TypeScript MCP server (.mjs) for Claude, ChatGPT, and Gemini to add, edit, and search Google Contacts from PNG, JPG, text, and markup.",
+  "type": "module",
+  "main": "google-contacts-mcp.mjs",
+  "bin": {
+    "google-contacts-mcp": "./google-contacts-mcp.mjs"
+  },
+  "files": [
+    "google-contacts-mcp.mjs",
+    "src/google-contacts-mcp.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node google-contacts-mcp.mjs",
+    "start:http": "node google-contacts-mcp.mjs --http",
+    "auth": "node google-contacts-mcp.mjs --auth",
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/google-contacts-mcp.test.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "google-contacts",
+    "people-api",
+    "claude",
+    "chatgpt",
+    "gemini",
+    "vcard",
+    "ocr",
+    "contacts"
+  ],
+  "author": "Ritesh Sonawala (@riteshsonawala)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/riteshsonawala/google-contacts-mcp.git"
+  }
+}
